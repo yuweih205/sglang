@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _can_use_zero_copy_qkv_a2a_4d,
     _ipc_input_a2a_qkv,
     _merge_attention_partials,
     _ring_attention_varlen,
@@ -102,6 +103,14 @@ _SP_PAD_MASK_DISABLED = envs.SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK
 PIPELINED_ATTENTION_BACKENDS = (
     AttentionBackendEnum.FA,
     AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+)
+
+# FA3/FA4 accept arbitrary Q/K/V strides as long as head_size is contiguous.
+# For batch-one dense Ulysses attention, consume the packed receive buffer
+# directly and remove three full-tensor unpack copies.  Set to zero for A/B or
+# rollback.
+_USP_ZERO_COPY_PACKED_QKV = (
+    os.environ.get("SGLANG_DIFFUSION_USP_ZERO_COPY_QKV", "1") != "0"
 )
 
 
@@ -1527,6 +1536,15 @@ class USPAttention(nn.Module):
                 q = q.contiguous()
                 k = k.contiguous()
                 v = v.contiguous()
+            elif (
+                _USP_ZERO_COPY_PACKED_QKV
+                and self.backend == AttentionBackendEnum.FA
+                and _fa_backend.fa_ver in (3, 4)
+                and self.head_size != 256
+                and get_ring_parallel_world_size() == 1
+                and _can_use_zero_copy_qkv_a2a_4d(q, k, v, sp_size)
+            ):
+                q, k, v = _usp_input_all_to_all_qkv(q, k, v, materialize=False)
             else:
                 q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
