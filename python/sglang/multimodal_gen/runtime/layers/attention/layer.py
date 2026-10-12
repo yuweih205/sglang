@@ -1495,6 +1495,17 @@ class USPAttention(nn.Module):
                 q, k, v, ctx_attn_metadata, num_replicated_kv_prefix
             )
 
+        use_zero_copy_qkv = (
+            sp_size > 1
+            and not qkv_pre_all_to_all
+            and _USP_ZERO_COPY_PACKED_QKV
+            and self.backend == AttentionBackendEnum.FA
+            and _fa_backend.fa_ver in (3, 4)
+            and self.head_size != 256
+            and get_ring_parallel_world_size() == 1
+            and _can_use_zero_copy_qkv_a2a_4d(q, k, v, sp_size)
+        )
+
         if (
             sp_size > 1
             and not qkv_pre_all_to_all
@@ -1508,7 +1519,9 @@ class USPAttention(nn.Module):
                 )
 
             def sequential():
-                qs, ks, vs = _usp_input_all_to_all_qkv(q, k, v)
+                qs, ks, vs = _usp_input_all_to_all_qkv(
+                    q, k, v, materialize=not use_zero_copy_qkv
+                )
                 out = self.attn_impl.forward(qs, ks, vs, ctx_attn_metadata)
                 return _usp_output_all_to_all(out, head_dim=2)
 
@@ -1536,14 +1549,7 @@ class USPAttention(nn.Module):
                 q = q.contiguous()
                 k = k.contiguous()
                 v = v.contiguous()
-            elif (
-                _USP_ZERO_COPY_PACKED_QKV
-                and self.backend == AttentionBackendEnum.FA
-                and _fa_backend.fa_ver in (3, 4)
-                and self.head_size != 256
-                and get_ring_parallel_world_size() == 1
-                and _can_use_zero_copy_qkv_a2a_4d(q, k, v, sp_size)
-            ):
+            elif use_zero_copy_qkv:
                 q, k, v = _usp_input_all_to_all_qkv(q, k, v, materialize=False)
             else:
                 q, k, v = _usp_input_all_to_all_qkv(q, k, v)
